@@ -33,14 +33,15 @@ type TunnelStream interface {
 
 // The dialer takes care of dispatching messages between gRPC and UDP connections
 type dialer struct {
-	id         ConnID
-	release    func()
-	bidiStream TunnelStream
-	incoming   chan Message
-	conn       net.Conn
-	idleTimer  *time.Timer
-	idleLock   sync.Mutex
-	connected  int32
+	id            ConnID
+	release       func()
+	bidiStream    TunnelStream
+	incoming      chan Message
+	conn          net.Conn
+	idleTimer     *time.Timer
+	idleLock      sync.Mutex
+	connected     int32
+	writerClosing int32
 }
 
 // NewDialer creates a new handler that dispatches messages in both directions between the given gRPC server
@@ -117,7 +118,16 @@ func (h *dialer) handleControl(ctx context.Context, cm Control) {
 	case Disconnect:
 		h.Close(ctx)
 		h.sendTCD(ctx, DisconnectOK)
-	case ReadClosed, WriteClosed:
+	case ReadClosed:
+		// If there's nothing more for us to read, then it's time to ask the writer to close.
+		// We do this instead of h.Close() because it will ensure that anything the writeLoop
+		// is already dealing with will be written. Will prevent connections from being
+		// abruptly terminated after the source has sent everything but before we've had
+		// a chance to forward it.
+		if atomic.LoadInt32(&h.connected) > 0 {
+			atomic.StoreInt32(&h.writerClosing, 1)
+		}
+	case WriteClosed:
 		h.Close(ctx)
 	case KeepAlive:
 		h.resetIdle()
@@ -161,7 +171,7 @@ func (h *dialer) sendTCD(ctx context.Context, code ControlCode) {
 func (h *dialer) readLoop(ctx context.Context) {
 	defer func() {
 		// allow write to drain and perform the close of the connection
-		dtime.SleepWithContext(ctx, 200*time.Millisecond)
+		dtime.SleepWithContext(ctx, 100*time.Millisecond)
 		close(h.incoming)
 	}()
 	b := make([]byte, 0x8000)
@@ -193,6 +203,7 @@ func (h *dialer) readLoop(ctx context.Context) {
 
 func (h *dialer) writeLoop(ctx context.Context) {
 	defer h.Close(ctx)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
 		case <-ctx.Done():
@@ -226,6 +237,10 @@ func (h *dialer) writeLoop(ctx context.Context) {
 				}
 				dlog.Debugf(ctx, "-> CONN %s, len %d", h.id, wn)
 				n += wn
+			}
+		case <-ticker.C:
+			if atomic.LoadInt32(&h.writerClosing) > 0 {
+				return
 			}
 		}
 	}
