@@ -1,5 +1,8 @@
 # Changelog
 
+### 2.3.2 (TBD)
+- Change: Telepresence is now installable via `brew install datawire/blackbird/telepresence`
+
 ### 2.3.1 (June 14, 2021)
 
 - Feature: Agents can now be installed using a mutator webhook
